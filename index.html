@@ -224,15 +224,15 @@
         window.addEventListener('click', (event) => {
           const isEl = event.target instanceof HTMLElement;
           if (!isEl) return;
-    
+
           // find ancestor links
           const linkEl = event.target.closest("a");
           if (!linkEl || !linkEl.href) return;
-    
-          event.preventDefault();
-          event.stopImmediatePropagation();
-    
+
+          // Handle special URL schemes (blob, data) or check if external
           if (linkEl.href.startsWith("blob-request:")) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
             const blob = getBlobFromURL(linkEl.href);
             if (!blob) return;
             void blob.arrayBuffer().then((data) => {
@@ -244,6 +244,8 @@
               });
             });
           } else if (linkEl.href.startsWith("data:")) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
             const [header, base64Data] = linkEl.href.split(",");
             const mimeMatch = header.match(/data:([^;]+)/);
             const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
@@ -257,16 +259,21 @@
               data,
               mimeType,
             });
-          } else {
+          } else if (!linkEl.href.startsWith("#")) {
+            // Check if external link
             let linkUrl;
             try {
               linkUrl = new URL(linkEl.href);
             } catch (error) {
               return;
             }
-    
+
+            // Allow same-hostname navigation to work normally
             if (linkUrl.hostname === window.location.hostname) return;
-      
+
+            // Only prevent default for external links
+            event.preventDefault();
+            event.stopImmediatePropagation();
             window.parent.postMessage({
               type: 'openExternal',
               href: linkEl.href,
