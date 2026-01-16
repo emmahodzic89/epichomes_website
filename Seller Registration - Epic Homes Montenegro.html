@@ -1,0 +1,1136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Seller Registration - Epic Homes Montenegro</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --emerald: #10B981;
+            --dark: #0f172a;
+            --white: #ffffff;
+            --gray: #64748b;
+            --light-gray: #f1f5f9;
+            --red: #ef4444;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, var(--dark) 0%, #1e293b 100%);
+            min-height: 100vh;
+            padding: 2rem;
+        }
+
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            background: var(--white);
+            border-radius: 16px;
+            padding: 3rem;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 3rem;
+        }
+
+        .logo {
+            width: 60px;
+            height: 60px;
+            background: var(--emerald);
+            border-radius: 8px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            font-size: 1.5rem;
+            color: var(--white);
+            margin-bottom: 1rem;
+        }
+
+        h1 {
+            font-size: 2rem;
+            color: var(--dark);
+            margin-bottom: 0.5rem;
+        }
+
+        .subtitle {
+            color: var(--gray);
+            font-size: 1.1rem;
+        }
+
+        .form-section {
+            margin-bottom: 2rem;
+        }
+
+        .section-title {
+            font-size: 1.3rem;
+            color: var(--dark);
+            margin-bottom: 1.5rem;
+            padding-bottom: 0.5rem;
+            border-bottom: 2px solid var(--emerald);
+        }
+
+        .form-group {
+            margin-bottom: 1.5rem;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 0.5rem;
+            color: var(--dark);
+            font-weight: 600;
+        }
+
+        .required {
+            color: var(--red);
+        }
+
+        input[type="text"],
+        input[type="email"],
+        input[type="tel"],
+        input[type="number"],
+        select,
+        textarea {
+            width: 100%;
+            padding: 0.9rem;
+            border: 2px solid #e2e8f0;
+            border-radius: 8px;
+            font-size: 1rem;
+            transition: border-color 0.3s;
+            font-family: inherit;
+        }
+
+        input:focus,
+        select:focus,
+        textarea:focus {
+            outline: none;
+            border-color: var(--emerald);
+        }
+
+        textarea {
+            resize: vertical;
+            min-height: 120px;
+        }
+
+        .form-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+        }
+
+        .form-row-3 {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 1rem;
+        }
+
+        .file-upload {
+            border: 2px dashed #e2e8f0;
+            border-radius: 8px;
+            padding: 2rem;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s;
+            background: var(--light-gray);
+        }
+
+        .file-upload:hover {
+            border-color: var(--emerald);
+            background: #ecfdf5;
+        }
+
+        .file-upload.active {
+            border-color: var(--emerald);
+            background: #ecfdf5;
+        }
+
+        .file-upload input[type="file"] {
+            display: none;
+        }
+
+        .file-icon {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+        }
+
+        .file-list {
+            margin-top: 1rem;
+            text-align: left;
+        }
+
+        .file-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.8rem;
+            background: var(--white);
+            border: 1px solid #e2e8f0;
+            border-radius: 6px;
+            margin-bottom: 0.5rem;
+        }
+
+        .file-name {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            color: var(--dark);
+        }
+
+        .remove-file {
+            background: var(--red);
+            color: var(--white);
+            border: none;
+            padding: 0.3rem 0.8rem;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.85rem;
+        }
+
+        .checkbox-group {
+            display: flex;
+            gap: 0.8rem;
+            margin-bottom: 1rem;
+        }
+
+        .checkbox-group input[type="checkbox"] {
+            margin-top: 0.2rem;
+            width: 20px;
+            height: 20px;
+            cursor: pointer;
+            flex-shrink: 0;
+        }
+
+        .checkbox-group label {
+            margin: 0;
+            font-weight: normal;
+            cursor: pointer;
+            font-size: 0.95rem;
+            line-height: 1.5;
+        }
+
+        .info-box {
+            background: #ecfdf5;
+            border-left: 4px solid var(--emerald);
+            padding: 1rem;
+            border-radius: 4px;
+            margin-bottom: 2rem;
+        }
+
+        .info-box p {
+            color: var(--gray);
+            line-height: 1.6;
+        }
+
+        .warning-box {
+            background: #fef2f2;
+            border-left: 4px solid var(--red);
+            padding: 1rem;
+            border-radius: 4px;
+            margin-top: 1rem;
+        }
+
+        .warning-box p {
+            color: #991b1b;
+            line-height: 1.6;
+            font-size: 0.95rem;
+        }
+
+        .submit-btn {
+            width: 100%;
+            padding: 1.2rem;
+            background: var(--emerald);
+            color: var(--white);
+            border: none;
+            border-radius: 8px;
+            font-size: 1.1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            margin-top: 2rem;
+        }
+
+        .submit-btn:hover:not(:disabled) {
+            background: #059669;
+            transform: translateY(-2px);
+            box-shadow: 0 10px 25px rgba(16, 185, 129, 0.3);
+        }
+
+        .submit-btn:disabled {
+            background: var(--gray);
+            cursor: not-allowed;
+        }
+
+        .success-message {
+            display: none;
+            text-align: center;
+            padding: 3rem;
+        }
+
+        .success-message.show {
+            display: block;
+        }
+
+        .success-icon {
+            font-size: 4rem;
+            margin-bottom: 1rem;
+        }
+
+        .photo-upload-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+            gap: 1rem;
+            margin-top: 1rem;
+        }
+
+        .photo-preview {
+            position: relative;
+            aspect-ratio: 1;
+            border-radius: 8px;
+            overflow: hidden;
+            border: 2px solid #e2e8f0;
+        }
+
+        .photo-preview img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .photo-preview .remove-photo {
+            position: absolute;
+            top: 0.5rem;
+            right: 0.5rem;
+            background: var(--red);
+            color: var(--white);
+            border: none;
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            cursor: pointer;
+            font-size: 1.2rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .help-text {
+            font-size: 0.85rem;
+            color: var(--gray);
+            margin-top: 0.3rem;
+            font-style: italic;
+        }
+
+        @media (max-width: 768px) {
+            .container {
+                padding: 2rem 1.5rem;
+            }
+
+            .form-row, .form-row-3 {
+                grid-template-columns: 1fr;
+            }
+
+            h1 {
+                font-size: 1.5rem;
+            }
+        }
+    </style>
+</head>
+<body id="artifacts-component-root-html">
+    <div class="container">
+        <div class="header">
+            <div class="logo">EH</div>
+            <h1>Seller Registration</h1>
+            <p class="subtitle">List Your Property with Epic Homes Montenegro</p>
+        </div>
+
+        <div class="info-box">
+            <p>📋 Complete this form to list your property. Our team will review your submission and contact you within 24 hours. Upon approval, your property will be featured on our platform and marketed to qualified buyers.</p>
+        </div>
+
+        <form id="sellerForm">
+            <!-- Owner Information -->
+            <div class="form-section">
+                <h2 class="section-title">Owner Information</h2>
+                
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>First Name <span class="required">*</span></label>
+                        <input type="text" name="firstName" required>
+                    </div>
+                    <div class="form-group">
+                        <label>Last Name <span class="required">*</span></label>
+                        <input type="text" name="lastName" required>
+                    </div>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Email Address <span class="required">*</span></label>
+                        <input type="email" name="email" required>
+                    </div>
+                    <div class="form-group">
+                        <label>Phone Number <span class="required">*</span></label>
+                        <input type="tel" name="phone" placeholder="+382..." required>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label>Preferred Contact Method <span class="required">*</span></label>
+                    <select name="contactMethod" required>
+                        <option value="">Select method</option>
+                        <option value="phone">Phone Call</option>
+                        <option value="whatsapp">WhatsApp</option>
+                        <option value="telegram">Telegram</option>
+                        <option value="viber">Viber</option>
+                        <option value="email">Email</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- Property Details -->
+            <div class="form-section">
+                <h2 class="section-title">Property Details</h2>
+                
+                <div class="form-group">
+                    <label>Property Type <span class="required">*</span></label>
+                    <select name="propertyType" required>
+                        <option value="">Select property type</option>
+                        <option value="apartment">Apartment</option>
+                        <option value="villa">Villa/House</option>
+                        <option value="penthouse">Penthouse</option>
+                        <option value="studio">Studio</option>
+                        <option value="land">Land</option>
+                        <option value="commercial">Commercial Property</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label>Property Title <span class="required">*</span></label>
+                    <input type="text" name="propertyTitle" placeholder="e.g., Luxury 2-Bedroom Apartment with Sea View" required>
+                    <p class="help-text">Create an attractive title for your property listing</p>
+                </div>
+
+                <div class="form-group">
+                    <label>Full Address <span class="required">*</span></label>
+                    <input type="text" name="address" placeholder="Street, Building, Unit Number" required>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>City/Municipality <span class="required">*</span></label>
+                        <select name="city" required>
+                            <option value="">Select city</option>
+                            <option value="budva">Budva</option>
+                            <option value="kotor">Kotor</option>
+                            <option value="tivat">Tivat</option>
+                            <option value="podgorica">Podgorica</option>
+                            <option value="bar">Bar</option>
+                            <option value="herceg-novi">Herceg Novi</option>
+                            <option value="cetinje">Cetinje</option>
+                            <option value="niksic">Nikšić</option>
+                            <option value="ulcinj">Ulcinj</option>
+                            <option value="other">Other</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Neighborhood</label>
+                        <input type="text" name="neighborhood">
+                    </div>
+                </div>
+
+                <div class="form-row-3">
+                    <div class="form-group">
+                        <label>Bedrooms <span class="required">*</span></label>
+                        <select name="bedrooms" required>
+                            <option value="">Select</option>
+                            <option value="studio">Studio</option>
+                            <option value="1">1</option>
+                            <option value="2">2</option>
+                            <option value="3">3</option>
+                            <option value="4">4</option>
+                            <option value="5+">5+</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Bathrooms <span class="required">*</span></label>
+                        <select name="bathrooms" required>
+                            <option value="">Select</option>
+                            <option value="1">1</option>
+                            <option value="1.5">1.5</option>
+                            <option value="2">2</option>
+                            <option value="2.5">2.5</option>
+                            <option value="3">3</option>
+                            <option value="3+">3+</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Size (m²) <span class="required">*</span></label>
+                        <input type="number" name="size" min="1" required>
+                    </div>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Floor</label>
+                        <input type="text" name="floor" placeholder="e.g., 2nd floor, Ground floor">
+                    </div>
+                    <div class="form-group">
+                        <label>Year Built</label>
+                        <input type="number" name="yearBuilt" min="1900" max="2026">
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label>Property Features</label>
+                    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.5rem;">
+                        <div class="checkbox-group">
+                            <input type="checkbox" id="seaView" name="features" value="seaView">
+                            <label for="seaView">Sea View</label>
+                        </div>
+                        <div class="checkbox-group">
+                            <input type="checkbox" id="parking" name="features" value="parking">
+                            <label for="parking">Parking</label>
+                        </div>
+                        <div class="checkbox-group">
+                            <input type="checkbox" id="balcony" name="features" value="balcony">
+                            <label for="balcony">Balcony/Terrace</label>
+                        </div>
+                        <div class="checkbox-group">
+                            <input type="checkbox" id="pool" name="features" value="pool">
+                            <label for="pool">Swimming Pool</label>
+                        </div>
+                        <div class="checkbox-group">
+                            <input type="checkbox" id="garden" name="features" value="garden">
+                            <label for="garden">Garden</label>
+                        </div>
+                        <div class="checkbox-group">
+                            <input type="checkbox" id="aircon" name="features" value="aircon">
+                            <label for="aircon">Air Conditioning</label>
+                        </div>
+                        <div class="checkbox-group">
+                            <input type="checkbox" id="heating" name="features" value="heating">
+                            <label for="heating">Central Heating</label>
+                        </div>
+                        <div class="checkbox-group">
+                            <input type="checkbox" id="furnished" name="features" value="furnished">
+                            <label for="furnished">Furnished</label>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label>Property Description <span class="required">*</span></label>
+                    <textarea name="description" placeholder="Describe your property in detail... highlight unique features, location benefits, recent renovations, etc." required></textarea>
+                    <p class="help-text">Be detailed - buyers love to know everything about the property!</p>
+                </div>
+            </div>
+
+            <!-- Pricing & Sale Information -->
+            <div class="form-section">
+                <h2 class="section-title">Pricing & Sale Information</h2>
+                
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Listing Type <span class="required">*</span></label>
+                        <select name="listingType" required>
+                            <option value="">Select type</option>
+                            <option value="sale">For Sale</option>
+                            <option value="rent">For Rent</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Price (EUR) <span class="required">*</span></label>
+                        <input type="number" name="price" min="1" placeholder="e.g., 285000" required>
+                        <p class="help-text">Enter the full amount (e.g., 285000 for €285,000)</p>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <div class="checkbox-group">
+                        <input type="checkbox" id="negotiable" name="negotiable">
+                        <label for="negotiable">Price is negotiable</label>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label>Available From</label>
+                    <select name="availability">
+                        <option value="immediate">Immediately</option>
+                        <option value="1month">Within 1 month</option>
+                        <option value="3months">Within 3 months</option>
+                        <option value="custom">Custom date</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- Property Photos -->
+            <div class="form-section">
+                <h2 class="section-title">Property Photos <span class="required">*</span></h2>
+                <p style="color: var(--gray); margin-bottom: 1rem;">Upload high-quality photos of your property (minimum 3, maximum 20)</p>
+                
+                <div class="file-upload" id="photoUploadArea">
+                    <input type="file" id="photoInput" name="photos" multiple accept="image/*">
+                    <div class="file-icon">📷</div>
+                    <p style="color: var(--dark); font-weight: 600; margin-bottom: 0.5rem;">Click to upload or drag and drop photos</p>
+                    <p style="color: var(--gray); font-size: 0.9rem;">JPG, PNG (Max 10MB per photo)</p>
+                </div>
+
+                <div class="photo-upload-grid" id="photoGrid"></div>
+            </div>
+
+            <!-- Documents Upload -->
+            <div class="form-section">
+                <h2 class="section-title">Required Documents <span class="required">*</span></h2>
+                <p style="color: var(--gray); margin-bottom: 1rem;">Please upload: Title Deed, Property Tax documents, Floor Plans (if available)</p>
+                
+                <div class="file-upload" id="docUploadArea">
+                    <input type="file" id="docInput" name="documents" multiple accept=".pdf,.jpg,.jpeg,.png,.doc,.docx">
+                    <div class="file-icon">📄</div>
+                    <p style="color: var(--dark); font-weight: 600; margin-bottom: 0.5rem;">Click to upload documents</p>
+                    <p style="color: var(--gray); font-size: 0.9rem;">PDF, JPG, PNG, DOC (Max 10MB per file)</p>
+                </div>
+
+                <div class="file-list" id="docList"></div>
+
+                <div class="warning-box">
+                    <p>⚠️ <strong>Important:</strong> All documents must be authentic and legally valid. Submitting false information may result in legal consequences and listing removal.</p>
+                </div>
+            </div>
+
+            <!-- Terms and Conditions -->
+            <div class="form-section">
+                <div style="background: var(--light-gray); padding: 1.5rem; border-radius: 8px;">
+                    <div class="checkbox-group">
+                        <input type="checkbox" id="ownership" name="ownership" required>
+                        <label for="ownership">
+                            <strong>I confirm that I am the legal owner of this property or authorized to list it for sale/rent</strong>
+                        </label>
+                    </div>
+                    
+                    <div class="checkbox-group">
+                        <input type="checkbox" id="accuracy" name="accuracy" required>
+                        <label for="accuracy">
+                            <strong>I confirm that all information and documents provided are accurate and authentic</strong>
+                        </label>
+                    </div>
+                    
+                    <div class="checkbox-group">
+                        <input type="checkbox" id="terms" name="terms" required>
+                        <label for="terms">
+                            I agree to Epic Homes Montenegro's <strong>Terms & Conditions</strong>, <strong>Agency Agreement</strong>, and <strong>Commission Structure</strong>. I understand that a formal listing agreement will be sent to my email for review and signature.
+                        </label>
+                    </div>
+                </div>
+            </div>
+
+            <button type="submit" class="submit-btn" id="submitBtn">Submit Property Listing</button>
+        </form>
+
+        <div class="success-message" id="successMessage">
+            <div class="success-icon">✅</div>
+            <h2 style="color: var(--emerald); margin-bottom: 1rem;">Property Submitted Successfully!</h2>
+            <p style="color: var(--gray); font-size: 1.1rem; line-height: 1.8;">
+                Thank you for choosing Epic Homes Montenegro!
+                <br><br>
+                We've received your property listing and will review it within 24 hours. 
+                <br><br>
+                Our team will contact you shortly to:
+                <br>
+                ✓ Verify your documents
+                <br>
+                ✓ Schedule a property viewing
+                <br>
+                ✓ Send the listing agreement for your signature
+                <br>
+                ✓ Discuss our marketing strategy
+                <br><br>
+                <strong>Check your email for the listing agreement and next steps.</strong>
+            </p>
+            <button class="submit-btn" style="margin-top: 2rem; max-width: 300px;" onclick="location.reload()">List Another Property</button>
+        </div>
+    </div>
+
+    <script>
+        const form = document.getElementById('sellerForm');
+        const photoInput = document.getElementById('photoInput');
+        const photoUploadArea = document.getElementById('photoUploadArea');
+        const photoGrid = document.getElementById('photoGrid');
+        const docInput = document.getElementById('docInput');
+        const docUploadArea = document.getElementById('docUploadArea');
+        const docList = document.getElementById('docList');
+        const submitBtn = document.getElementById('submitBtn');
+        const successMessage = document.getElementById('successMessage');
+        
+        let uploadedPhotos = [];
+        let uploadedDocs = [];
+
+        // Photo upload handling
+        photoUploadArea.addEventListener('click', () => photoInput.click());
+
+        photoUploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            photoUploadArea.classList.add('active');
+        });
+
+        photoUploadArea.addEventListener('dragleave', () => {
+            photoUploadArea.classList.remove('active');
+        });
+
+        photoUploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            photoUploadArea.classList.remove('active');
+            handlePhotos(e.dataTransfer.files);
+        });
+
+        photoInput.addEventListener('change', (e) => {
+            handlePhotos(e.target.files);
+        });
+
+        function handlePhotos(files) {
+            for (let file of files) {
+                if (!file.type.startsWith('image/')) {
+                    alert(`${file.name} is not an image file.`);
+                    continue;
+                }
+                if (file.size > 10 * 1024 * 1024) {
+                    alert(`${file.name} is too large. Max size is 10MB.`);
+                    continue;
+                }
+                if (uploadedPhotos.length >= 20) {
+                    alert('Maximum 20 photos allowed.');
+                    break;
+                }
+                uploadedPhotos.push(file);
+            }
+            renderPhotoGrid();
+        }
+
+        function renderPhotoGrid() {
+            photoGrid.innerHTML = '';
+            uploadedPhotos.forEach((file, index) => {
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    const div = document.createElement('div');
+                    div.className = 'photo-preview';
+                    div.innerHTML = `
+                        <img src="${e.target.result}" alt="Property photo">
+                        <button type="button" class="remove-photo" onclick="removePhoto(${index})">×</button>
+                    `;
+                    photoGrid.appendChild(div);
+                };
+                reader.readAsDataURL(file);
+            });
+        }
+
+        function removePhoto(index) {
+            uploadedPhotos.splice(index, 1);
+            renderPhotoGrid();
+        }
+
+        // Document upload handling
+        docUploadArea.addEventListener('click', () => docInput.click());
+
+        docUploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            docUploadArea.classList.add('active');
+        });
+
+        docUploadArea.addEventListener('dragleave', () => {
+            docUploadArea.classList.remove('active');
+        });
+
+        docUploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            docUploadArea.classList.remove('active');
+            handleDocs(e.dataTransfer.files);
+        });
+
+        docInput.addEventListener('change', (e) => {
+            handleDocs(e.target.files);
+        });
+
+        function handleDocs(files) {
+            for (let file of files) {
+                if (file.size > 10 * 1024 * 1024) {
+                    alert(`${file.name} is too large. Max size is 10MB.`);
+                    continue;
+                }
+                uploadedDocs.push(file);
+                addDocToList(file);
+            }
+        }
+
+        function addDocToList(file) {
+            const fileItem = document.createElement('div');
+            fileItem.className = 'file-item';
+            fileItem.innerHTML = `
+                <span class="file-name">📎 ${file.name} (${formatFileSize(file.size)})</span>
+                <button type="button" class="remove-file" onclick="removeDoc('${file.name}')">Remove</button>
+            `;
+            docList.appendChild(fileItem);
+        }
+
+        function removeDoc(fileName) {
+            uploadedDocs = uploadedDocs.filter(f => f.name !== fileName);
+            renderDocList();
+        }
+
+        function renderDocList() {
+            docList.innerHTML = '';
+            uploadedDocs.forEach(file => addDocToList(file));
+        }
+
+        function formatFileSize(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+            return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+        }
+
+        // Form validation and submission
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            // Validate minimum photos
+            if (uploadedPhotos.length < 3) {
+                alert('Please upload at least 3 property photos.');
+                return;
+            }
+
+            // Validate documents
+            if (uploadedDocs.length === 0) {
+                alert('Please upload required documents (Title Deed, etc.).');
+                return;
+            }
+            
+            submitBtn.disabled = true;
+            submitBtn.textContent = 'Submitting...';
+
+            // Simulate form submission
+            setTimeout(() => {
+                form.style.display = 'none';
+                successMessage.classList.add('show');
+                
+                // Create form data
+                const formData = new FormData(form);
+                
+                // Add photos
+                uploadedPhotos.forEach((photo, index) => {
+                    formData.append(`photo_${index}`, photo);
+                });
+                
+                // Add documents
+                uploadedDocs.forEach((doc, index) => {
+                    formData.append(`document_${index}`, doc);
+                });
+                
+                console.log('Seller form submitted:', Object.fromEntries(formData));
+                console.log(`Uploaded ${uploadedPhotos.length} photos and ${uploadedDocs.length} documents`);
+                
+                // Send confirmation email
+                sendSellerConfirmation(formData.get('email'), formData.get('firstName'));
+            }, 2000);
+        });
+
+        function sendSellerConfirmation(email, name) {
+            console.log(`Confirmation email would be sent to: ${email}`);
+            console.log(`Welcome message for seller: ${name}`);
+            console.log('Email would include listing agreement and next steps');
+        }
+    </script>
+</body>
+</html>

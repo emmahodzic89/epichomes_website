@@ -1,0 +1,1006 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Epic Homes Montenegro - Your Gateway to Premium Living</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --emerald: #10B981;
+            --dark: #0f172a;
+            --white: #ffffff;
+            --gray: #64748b;
+            --light-gray: #f1f5f9;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            line-height: 1.6;
+            color: var(--dark);
+        }
+
+        header {
+            background: var(--white);
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            position: sticky;
+            top: 0;
+            z-index: 1000;
+        }
+
+        nav {
+            max-width: 1400px;
+            margin: 0 auto;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem 2rem;
+        }
+
+        .logo-section {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .logo {
+            width: 50px;
+            height: 50px;
+            background: var(--emerald);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            font-size: 1.3rem;
+            color: var(--white);
+        }
+
+        .brand {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .brand-name {
+            font-size: 1.3rem;
+            font-weight: 700;
+            color: var(--dark);
+        }
+
+        .brand-tag {
+            font-size: 0.8rem;
+            color: var(--gray);
+            font-style: italic;
+        }
+
+        nav ul {
+            display: flex;
+            list-style: none;
+            gap: 2rem;
+        }
+
+        nav a {
+            text-decoration: none;
+            color: var(--dark);
+            font-weight: 500;
+            transition: color 0.3s;
+        }
+
+        nav a:hover {
+            color: var(--emerald);
+        }
+
+        .hero {
+            background: linear-gradient(135deg, var(--dark) 0%, #1e293b 100%);
+            color: var(--white);
+            padding: 6rem 2rem;
+            text-align: center;
+        }
+
+        .hero h1 {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+            font-weight: 700;
+        }
+
+        .hero .tagline {
+            font-size: 1.3rem;
+            color: var(--emerald);
+            margin-bottom: 2rem;
+            font-weight: 300;
+        }
+
+        .cta-buttons {
+            display: flex;
+            gap: 1rem;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+
+        .btn {
+            padding: 1rem 2rem;
+            border: none;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .btn-primary {
+            background: var(--emerald);
+            color: var(--white);
+        }
+
+        .btn-primary:hover {
+            background: #059669;
+            transform: translateY(-2px);
+        }
+
+        .btn-secondary {
+            background: var(--white);
+            color: var(--dark);
+        }
+
+        .btn-secondary:hover {
+            background: var(--light-gray);
+            transform: translateY(-2px);
+        }
+
+        .contact-bar {
+            background: var(--emerald);
+            padding: 1rem;
+            display: flex;
+            justify-content: center;
+            gap: 2rem;
+            flex-wrap: wrap;
+        }
+
+        .contact-bar a {
+            color: var(--white);
+            text-decoration: none;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-weight: 500;
+            transition: opacity 0.3s;
+        }
+
+        .contact-bar a:hover {
+            opacity: 0.8;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 4rem 2rem;
+        }
+
+        .section-title {
+            text-align: center;
+            font-size: 2.5rem;
+            margin-bottom: 3rem;
+            color: var(--dark);
+        }
+
+        .properties-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 2rem;
+            margin-bottom: 2rem;
+        }
+
+        .property-card {
+            background: var(--white);
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+            transition: transform 0.3s;
+        }
+
+        .property-card:hover {
+            transform: translateY(-5px);
+        }
+
+        .property-image {
+            width: 100%;
+            height: 250px;
+            background: var(--light-gray);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--gray);
+            font-size: 3rem;
+        }
+
+        .property-info {
+            padding: 1.5rem;
+        }
+
+        .property-price {
+            font-size: 1.8rem;
+            color: var(--emerald);
+            font-weight: 700;
+            margin-bottom: 0.5rem;
+        }
+
+        .property-title {
+            font-size: 1.3rem;
+            margin-bottom: 0.5rem;
+            color: var(--dark);
+        }
+
+        .property-location {
+            color: var(--gray);
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.3rem;
+        }
+
+        .property-features {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 1rem;
+            color: var(--gray);
+        }
+
+        .feature {
+            display: flex;
+            align-items: center;
+            gap: 0.3rem;
+        }
+
+        .property-type {
+            display: inline-block;
+            background: var(--emerald);
+            color: var(--white);
+            padding: 0.3rem 0.8rem;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-weight: 600;
+        }
+
+        .filter-bar {
+            background: var(--light-gray);
+            padding: 2rem;
+            border-radius: 12px;
+            margin-bottom: 3rem;
+        }
+
+        .filter-options {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+        }
+
+        .filter-group {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        .filter-group label {
+            font-weight: 600;
+            color: var(--dark);
+        }
+
+        .filter-group select, .filter-group input {
+            padding: 0.7rem;
+            border: 2px solid var(--white);
+            border-radius: 8px;
+            font-size: 1rem;
+            background: var(--white);
+        }
+
+        .agent-section {
+            background: var(--light-gray);
+            padding: 4rem 0;
+        }
+
+        .agent-card {
+            max-width: 800px;
+            margin: 0 auto;
+            background: var(--white);
+            border-radius: 12px;
+            padding: 3rem;
+            display: flex;
+            gap: 3rem;
+            align-items: center;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+        }
+
+        .agent-photo {
+            width: 200px;
+            height: 200px;
+            border-radius: 50%;
+            overflow: hidden;
+            flex-shrink: 0;
+            border: 5px solid var(--emerald);
+        }
+
+        .agent-photo img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .agent-info h3 {
+            font-size: 2rem;
+            margin-bottom: 0.5rem;
+            color: var(--dark);
+        }
+
+        .agent-title {
+            color: var(--emerald);
+            font-size: 1.1rem;
+            margin-bottom: 1rem;
+            font-weight: 600;
+        }
+
+        .agent-description {
+            color: var(--gray);
+            margin-bottom: 1.5rem;
+            line-height: 1.8;
+        }
+
+        .registration-section {
+            background: var(--dark);
+            color: var(--white);
+            padding: 4rem 2rem;
+        }
+
+        .registration-options {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 2rem;
+            max-width: 1000px;
+            margin: 0 auto;
+        }
+
+        .registration-card {
+            background: rgba(255,255,255,0.1);
+            padding: 3rem;
+            border-radius: 12px;
+            text-align: center;
+            transition: all 0.3s;
+            border: 2px solid transparent;
+        }
+
+        .registration-card:hover {
+            border-color: var(--emerald);
+            transform: translateY(-5px);
+        }
+
+        .registration-card h3 {
+            font-size: 1.8rem;
+            margin-bottom: 1rem;
+            color: var(--emerald);
+        }
+
+        .registration-card p {
+            margin-bottom: 2rem;
+            color: rgba(255,255,255,0.8);
+        }
+
+        footer {
+            background: var(--dark);
+            color: var(--white);
+            padding: 3rem 2rem;
+            text-align: center;
+        }
+
+        .footer-content {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        .footer-info {
+            margin-bottom: 2rem;
+        }
+
+        .footer-info p {
+            margin: 0.5rem 0;
+            color: rgba(255,255,255,0.8);
+        }
+
+        @media (max-width: 768px) {
+            .hero h1 {
+                font-size: 2rem;
+            }
+            
+            .agent-card {
+                flex-direction: column;
+                text-align: center;
+            }
+            
+            nav ul {
+                gap: 1rem;
+            }
+        }
+    </style>
+</head>
+<body id="artifacts-component-root-html">
+    <header>
+        <nav>
+            <div class="logo-section">
+                <div class="logo">EH</div>
+                <div class="brand">
+                    <div class="brand-name">Epic Homes Montenegro</div>
+                    <div class="brand-tag">Your Professional Guide for Montenegro Real Estate</div>
+                </div>
+            </div>
+            <ul>
+                <li><a href="index.html">Home</a></li>
+                <li><a href="#properties">Properties</a></li>
+                <li><a href="#about">About</a></li>
+                <li><a href="#agent">Agent</a></li>
+                <li><a href="contact.html">Contact</a></li>
+                <li><a href="blog.html">Blog</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <div class="contact-bar">
+        <a href="https://wa.me/38268790678" target="_blank">
+            <span>📱</span> WhatsApp
+        </a>
+        <a href="https://t.me/38268790678" target="_blank">
+            <span>✈️</span> Telegram
+        </a>
+        <a href="viber://chat?number=38268790678" target="_blank">
+            <span>💜</span> Viber
+        </a>
+        <a href="tel:+38268790678">
+            <span>📞</span> +382 68 790 678
+        </a>
+        <a href="mailto:info.epichomegroup@gmail.com">
+            <span>✉️</span> Email Us
+        </a>
+    </div>
+
+    <section class="hero">
+        <h1>Welcome to Epic Homes Montenegro</h1>
+        <p class="tagline">Your Solution for Montenegro's Premium Living</p>
+        <div class="cta-buttons">
+            <a href="#properties" class="btn btn-primary">Explore Properties</a>
+            <a href="seller-registration-form.html" class="btn btn-secondary">List Your Property</a>
+        </div>
+    </section>
+
+    <section id="properties" class="container">
+        <h2 class="section-title">Featured Properties</h2>
+        
+        <div class="filter-bar">
+            <div class="filter-options">
+                <div class="filter-group">
+                    <label>Property Type</label>
+                    <select>
+                        <option>All Properties</option>
+                        <option>For Sale</option>
+                        <option>For Rent</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label>Location</label>
+                    <select>
+                        <option>All Locations</option>
+                        <option>Budva</option>
+                        <option>Kotor</option>
+                        <option>Tivat</option>
+                        <option>Podgorica</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label>Price Range</label>
+                    <select>
+                        <option>Any Price</option>
+                        <option>Under €100,000</option>
+                        <option>€100,000 - €250,000</option>
+                        <option>€250,000 - €500,000</option>
+                        <option>Over €500,000</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label>Bedrooms</label>
+                    <select>
+                        <option>Any</option>
+                        <option>1+</option>
+                        <option>2+</option>
+                        <option>3+</option>
+                        <option>4+</option>
+                    </select>
+                </div>
+            </div>
+        </div>
+
+        <div class="properties-grid">
+            <div class="property-card">
+                <div class="property-image">🏠</div>
+                <div class="property-info">
+                    <div class="property-type">For Sale</div>
+                    <div class="property-price">€285,000</div>
+                    <h3 class="property-title">Luxury Apartment with Sea View</h3>
+                    <p class="property-location">📍 Budva Riviera</p>
+                    <div class="property-features">
+                        <span class="feature">🛏️ 2 Beds</span>
+                        <span class="feature">🚿 2 Baths</span>
+                        <span class="feature">📐 85m²</span>
+                    </div>
+                    <a href="#" class="btn btn-primary" style="width: 100%; justify-content: center;">View Details</a>
+                </div>
+            </div>
+
+            <div class="property-card">
+                <div class="property-image">🏡</div>
+                <div class="property-info">
+                    <div class="property-type">For Sale</div>
+                    <div class="property-price">€450,000</div>
+                    <h3 class="property-title">Modern Villa with Pool</h3>
+                    <p class="property-location">📍 Tivat</p>
+                    <div class="property-features">
+                        <span class="feature">🛏️ 4 Beds</span>
+                        <span class="feature">🚿 3 Baths</span>
+                        <span class="feature">📐 180m²</span>
+                    </div>
+                    <a href="#" class="btn btn-primary" style="width: 100%; justify-content: center;">View Details</a>
+                </div>
+            </div>
+
+            <div class="property-card">
+                <div class="property-image">🏢</div>
+                <div class="property-info">
+                    <div class="property-type">For Rent</div>
+                    <div class="property-price">€800/month</div>
+                    <h3 class="property-title">City Center Apartment</h3>
+                    <p class="property-location">📍 Podgorica</p>
+                    <div class="property-features">
+                        <span class="feature">🛏️ 1 Bed</span>
+                        <span class="feature">🚿 1 Bath</span>
+                        <span class="feature">📐 55m²</span>
+                    </div>
+                    <a href="#" class="btn btn-primary" style="width: 100%; justify-content: center;">View Details</a>
+                </div>
+            </div>
+
+            <div class="property-card">
+                <div class="property-image">🏖️</div>
+                <div class="property-info">
+                    <div class="property-type">For Sale</div>
+                    <div class="property-price">€620,000</div>
+                    <h3 class="property-title">Beachfront Penthouse</h3>
+                    <p class="property-location">📍 Kotor Bay</p>
+                    <div class="property-features">
+                        <span class="feature">🛏️ 3 Beds</span>
+                        <span class="feature">🚿 2 Baths</span>
+                        <span class="feature">📐 120m²</span>
+                    </div>
+                    <a href="#" class="btn btn-primary" style="width: 100%; justify-content: center;">View Details</a>
+                </div>
+            </div>
+
+            <div class="property-card">
+                <div class="property-image">🌳</div>
+                <div class="property-info">
+                    <div class="property-type">For Rent</div>
+                    <div class="property-price">€1,200/month</div>
+                    <h3 class="property-title">Family House with Garden</h3>
+                    <p class="property-location">📍 Budva</p>
+                    <div class="property-features">
+                        <span class="feature">🛏️ 3 Beds</span>
+                        <span class="feature">🚿 2 Baths</span>
+                        <span class="feature">📐 140m²</span>
+                    </div>
+                    <a href="#" class="btn btn-primary" style="width: 100%; justify-content: center;">View Details</a>
+                </div>
+            </div>
+
+            <div class="property-card">
+                <div class="property-image">🏘️</div>
+                <div class="property-info">
+                    <div class="property-type">For Sale</div>
+                    <div class="property-price">€195,000</div>
+                    <h3 class="property-title">Cozy Studio Near Beach</h3>
+                    <p class="property-location">📍 Budva</p>
+                    <div class="property-features">
+                        <span class="feature">🛏️ Studio</span>
+                        <span class="feature">🚿 1 Bath</span>
+                        <span class="feature">📐 42m²</span>
+                    </div>
+                    <a href="#" class="btn btn-primary" style="width: 100%; justify-content: center;">View Details</a>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section id="about" class="container">
+        <h2 class="section-title">About Epic Homes Montenegro</h2>
+        <div style="max-width: 900px; margin: 0 auto; text-align: center;">
+            <p style="font-size: 1.2rem; color: var(--gray); line-height: 1.8; margin-bottom: 2rem;">
+                Epic Homes Montenegro is your premier partner for discovering exceptional properties throughout Montenegro, with a special focus on the stunning Boka Bay region. We specialize in connecting international buyers and investors with the finest real estate opportunities along the Adriatic coast and beyond.
+            </p>
+            <p style="font-size: 1.2rem; color: var(--gray); line-height: 1.8; margin-bottom: 2rem;">
+                From the UNESCO-protected Bay of Kotor to the vibrant beaches of Budva, the exclusive Porto Montenegro marina in Tivat, and emerging markets throughout the country, we help you find your perfect property in this Mediterranean paradise.
+            </p>
+            <div style="background: var(--emerald); color: var(--white); padding: 1.5rem; border-radius: 12px; margin: 2rem 0; font-size: 1.1rem; font-weight: 600;">
+                🌊 Proudly Operating Throughout Montenegro | Specializing in Boka Bay Region 🏔️
+            </div>
+            <div style="background: var(--light-gray); padding: 2rem; border-radius: 12px; margin-top: 3rem;">
+                <h3 style="font-size: 1.8rem; margin-bottom: 1rem; color: var(--dark);">Why Montenegro?</h3>
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1.5rem; text-align: left;">
+                    <div>
+                        <strong style="color: var(--emerald);">🌊 Mediterranean Lifestyle</strong>
+                        <p style="color: var(--gray); margin-top: 0.5rem;">300+ days of sunshine, pristine beaches, and crystal-clear waters</p>
+                    </div>
+                    <div>
+                        <strong style="color: var(--emerald);">💰 Favorable Investment</strong>
+                        <p style="color: var(--gray); margin-top: 0.5rem;">Competitive property prices and attractive tax benefits</p>
+                    </div>
+                    <div>
+                        <strong style="color: var(--emerald);">🏔️ Natural Beauty</strong>
+                        <p style="color: var(--gray); margin-top: 0.5rem;">From mountains to coast, UNESCO sites, and national parks</p>
+                    </div>
+                    <div>
+                        <strong style="color: var(--emerald);">🌍 Strategic Location</strong>
+                        <p style="color: var(--gray); margin-top: 0.5rem;">Gateway to Europe, Balkans, and Mediterranean region</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section id="agent" class="agent-section">
+        <div class="container">
+            <h2 class="section-title">Meet Your Agent</h2>
+            <div class="agent-card">
+                <div class="agent-photo">
+                    <img src="ema-photo.jpg" alt="Ema Hodzic" style="width: 100%; height: 100%; object-fit: cover;">
+                </div>
+                <div class="agent-info">
+                    <h3>Ema Hodžić</h3>
+                    <p class="agent-title">Founder & Real Estate Consultant</p>
+                    <p class="agent-description">
+                        With deep knowledge of Montenegro's real estate market and a passion for helping clients find their dream properties, I personally guide you through every step of your property journey. Whether you're looking to invest, relocate, or find a vacation home, I'm here to make your Montenegro dreams a reality.
+                    </p>
+                    <div class="cta-buttons">
+                        <a href="https://wa.me/38268790678" class="btn btn-primary">Contact Me</a>
+                        <a href="mailto:info.epichomegroup@gmail.com" class="btn btn-secondary">Email Me</a>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section id="register" class="registration-section">
+        <div class="container">
+            <h2 class="section-title">Get Started</h2>
+            <div class="registration-options">
+                <div class="registration-card">
+                    <h3>🏠 Want to Buy?</h3>
+                    <p>Interested to know more about Montenegro's property collection? Register to access exclusive listings and receive personalized recommendations.</p>
+                    <a href="mailto:info.epichomegroup@gmail.com?subject=Buyer Registration - Interested in Properties" class="btn btn-primary">Register as Buyer</a>
+                </div>
+                <div class="registration-card">
+                    <h3>💼 Want to Sell?</h3>
+                    <p>Want to sell in Montenegro? Upload your property, submit required documents, and let us connect you with qualified buyers.</p>
+                    <a href="mailto:info.epichomegroup@gmail.com?subject=Seller Registration - Upload Property" class="btn btn-primary">Register as Seller</a>
+                </div>
+            </div>
+            <div style="max-width: 800px; margin: 3rem auto 0; text-align: center; color: rgba(255,255,255,0.7); font-size: 0.9rem;">
+                <p>By registering, you agree to our terms and conditions and agency policies. A confirmation and service agreement will be sent to your email upon registration.</p>
+            </div>
+        </div>
+    </section>
+
+    <footer>
+        <div class="footer-content">
+            <div class="footer-info">
+                <h3 style="color: var(--emerald); margin-bottom: 1rem;">Epic Homes Montenegro</h3>
+                <p>Your Professional Guide for Montenegro Real Estate</p>
+                <p style="margin-top: 0.5rem;">Operating in Boka Bay and throughout Montenegro</p>
+                <p>📞 +382 68 790 678</p>
+                <p>✉️ info.epichomegroup@gmail.com</p>
+            </div>
+            <p style="margin-top: 2rem; color: rgba(255,255,255,0.6);">
+                © 2026 Epic Homes Montenegro. All rights reserved.
+            </p>
+        </div>
+    </footer>
+</body>
+</html>
